@@ -1,0 +1,16 @@
+universe = vanilla
+executable = /bin/bash
+arguments = /lustre/home/jyeon/gsae/scripts/build_container.sh gsae
+initialdir = /lustre/home/jyeon/gsae
+should_transfer_files = NO
+getenv = True
+stream_output = True
+stream_error = True
+output = /fast/jyeon/gsae/logs/build_container_$(Cluster).out
+error = /fast/jyeon/gsae/logs/build_container_$(Cluster).err
+log = /fast/jyeon/gsae/logs/build_container_$(Cluster).log
+request_cpus = 8
+request_memory = 32000
+request_disk = 120G
++BypassLXCfs = "true"
+queue

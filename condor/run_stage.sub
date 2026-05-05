@@ -1,0 +1,19 @@
+universe = vanilla
+executable = /bin/bash
+arguments = /lustre/home/jyeon/gsae/scripts/run_stage_in_container.sh $(stage) /lustre/home/jyeon/gsae/configs/default.yaml
+initialdir = /lustre/home/jyeon/gsae
+should_transfer_files = NO
+getenv = True
+environment = "USE_NV=1"
+stream_output = True
+stream_error = True
+output = /fast/jyeon/gsae/logs/$(stage)_$(Cluster).out
+error = /fast/jyeon/gsae/logs/$(stage)_$(Cluster).err
+log = /fast/jyeon/gsae/logs/$(stage)_$(Cluster).log
+request_cpus = 16
+request_memory = 128000
+request_gpus = 1
+request_disk = 200G
++BypassLXCfs = "true"
+stage = smoke
+queue

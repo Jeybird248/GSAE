@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gsae-steering"
+version = "0.1.0"
+description = "Graph-Regularized Sparse Autoencoders for LLM safety steering"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate>=0.28",
+  "datasets>=2.18",
+  "joblib>=1.2",
+  "numpy>=1.23",
+  "pyyaml>=6.0",
+  "scikit-learn>=1.2",
+  "safetensors>=0.4",
+  "torch>=2.1",
+  "tqdm>=4.66",
+  "transformers>=4.40",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+gsae = "gsae.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

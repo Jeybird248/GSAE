@@ -1,0 +1,57 @@
+training:
+  seed: 248
+  layers: [6, 8, 10, 12]
+  latent_multiplier: 16
+  latent_dim:
+  batch_size: 16
+  steps: 500
+  lr: 0.001
+  lambda_sparse: 0.0001
+  lambda_sup: 0.02
+  lambda_graph: 0.001
+  graph_threshold: 0.6
+  graph_chunk_size: 1024
+  normalize_decoder: true
+
+bank:
+  eta: 1.0
+  rho: 0.95
+  candidate_pool_size: 2000
+  a: 1.0
+  b: 1.0
+  c: 1.0
+  efficacy_mode: activation_proxy
+  efficacy_file:
+  eps_srr: 0.05
+
+gate:
+  classifier: calibrated_random_forest
+  n_estimators: 300
+  input_t_low: 0.30
+  input_t_high: 0.65
+  cont_d_low: 0.70
+  cont_d_high: 0.90
+  n_up: 2
+  n_down: 3
+
+runtime:
+  alpha: 2.5
+  refusal_template: "Sorry, but I can't help with that request."
+
+model_presets:
+  llama3_8b:
+    layers: [6, 8, 10, 12]
+    hidden_dim: 4096
+    latent_multiplier: 16
+  mistral_7b:
+    layers: [6, 8, 10, 12]
+    hidden_dim: 4096
+    latent_multiplier: 16
+  qwen25_14b:
+    layers: [10, 14, 18, 22]
+    hidden_dim: 5120
+    latent_multiplier: 16
+  phi4_15b:
+    layers: [8, 12, 16, 20]
+    hidden_dim: 5120
+    latent_multiplier: 16
