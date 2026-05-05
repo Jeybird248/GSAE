@@ -9,8 +9,5 @@ stream_error = True
 output = /fast/jyeon/gsae/logs/build_container_$(Cluster).out
 error = /fast/jyeon/gsae/logs/build_container_$(Cluster).err
 log = /fast/jyeon/gsae/logs/build_container_$(Cluster).log
-request_cpus = 8
-request_memory = 32000
-request_disk = 120G
 +BypassLXCfs = "true"
 queue

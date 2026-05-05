@@ -10,10 +10,9 @@ stream_error = True
 output = /fast/jyeon/gsae/logs/$(stage)_$(Cluster).out
 error = /fast/jyeon/gsae/logs/$(stage)_$(Cluster).err
 log = /fast/jyeon/gsae/logs/$(stage)_$(Cluster).log
-request_cpus = 16
-request_memory = 128000
+# Paper, Appendix C.1: single NVIDIA A100 GPU with 40 GB VRAM.
 request_gpus = 1
-request_disk = 200G
+require_gpus = regexp("A100", DeviceName) && (GlobalMemoryMb >= 40000)
 +BypassLXCfs = "true"
 stage = smoke
 queue
