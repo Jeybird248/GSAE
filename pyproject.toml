@@ -16,21 +16,16 @@ dependencies = [
   "pyyaml>=6.0",
   "scikit-learn>=1.2",
   "safetensors>=0.4",
-  "torch>=2.1",
+  "torch>=2.4",
   "tqdm>=4.66",
-  "transformers>=4.40",
+  "transformers>=4.55,<5",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+judge = ["openai>=1"]
 
 [project.scripts]
 gsae = "gsae.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src"]
-addopts = "-q"

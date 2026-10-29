@@ -33,10 +33,7 @@ class GraphSparseAutoencoder(nn.Module):
 
 
 def graph_dirichlet(decoder_weight: torch.Tensor, laplacian: torch.Tensor) -> torch.Tensor:
-    """Return the summed decoder-column Dirichlet energy trace(W^T L W).
-
-    Matches the paper's sum_j d_j^T L d_j (no normalization by k).
-    """
+    """Return decoder-column Dirichlet energy trace(W^T L W), without averaging."""
 
     laplacian = laplacian.to(decoder_weight.device)
     if laplacian.is_sparse:
@@ -56,7 +53,7 @@ def gsae_loss(
     lambda_graph: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     z, recon, logits = model(x)
-    # Reductions follow Algorithm 1: mean over batch, sum over feature dim.
+    # Average over examples and sum over features.
     rec = (recon - x).pow(2).sum(dim=1).mean()
     sparse = z.abs().sum(dim=1).mean()
     sup = F.cross_entropy(logits, y.long())

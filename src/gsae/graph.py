@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 
 import torch
 import torch.nn.functional as F
@@ -15,20 +16,21 @@ def build_threshold_cosine_laplacian(
     center: bool = False,
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
-    """Build the masked normalized graph Laplacian from prompt activations.
+    """Build a masked normalized Laplacian from [num_examples, hidden_dim] states.
 
-    Args:
-        activations: Tensor with shape [num_examples, hidden_dim].
-        threshold: Keep cosine edges with similarity >= threshold.
-        chunk_size: Row chunk for the dense similarity computation.
-        center: If True, subtract each neuron's mean activation profile first
-            (turning the similarity into Pearson correlation). The paper uses
-            raw cosine similarity, so the default is False.
-        device: Compute device. The returned sparse tensor is on CPU.
+    Keep positive cosine edges at or above threshold. Centering subtracts each
+    neuron's mean activation. Compute chunk_size rows at a time and return a
+    CPU sparse tensor.
     """
 
     if activations.ndim != 2:
         raise ValueError("activations must have shape [num_examples, hidden_dim]")
+    if min(activations.shape) == 0 or not torch.isfinite(activations).all():
+        raise ValueError("activations must be nonempty and finite")
+    if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError("threshold must be finite and in [0, 1]")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
     x = activations.float().to(device).T.contiguous()  # [hidden_dim, num_examples]
     if center:
         x = x - x.mean(dim=1, keepdim=True)
@@ -43,7 +45,8 @@ def build_threshold_cosine_laplacian(
         sim = x[start:stop] @ x.T
         local_rows = torch.arange(start, stop, device=device).unsqueeze(1)
         global_cols = torch.arange(hidden_dim, device=device).unsqueeze(0)
-        mask = (sim >= threshold) & (local_rows != global_cols)
+        # Compute each undirected edge once so threshold rounding cannot break symmetry.
+        mask = (sim >= threshold) & (sim > 0) & (local_rows < global_cols)
         nz = mask.nonzero(as_tuple=False)
         if nz.numel() == 0:
             continue
@@ -59,6 +62,7 @@ def build_threshold_cosine_laplacian(
     row = torch.cat(rows).long()
     col = torch.cat(cols).long()
     val = torch.cat(vals).float().clamp_min(0)
+    row, col, val = torch.cat([row, col]), torch.cat([col, row]), torch.cat([val, val])
     deg = torch.zeros(hidden_dim, dtype=torch.float32)
     deg.index_add_(0, row, val)
     nonzero = deg > 0

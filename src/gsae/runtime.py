@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -7,7 +8,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .activation import mean_pool
+from .activation import capture_layer_hiddens, get_decoder_layers, mean_pool
 from .bank import load_bank
 from .gate import load_gate
 from .train import checkpoint_path, load_gsae_checkpoint
@@ -17,24 +18,21 @@ from .utils import choose_device
 DEFAULT_REFUSAL = "Sorry, but I can't help with that request."
 
 
-def get_decoder_layers(model) -> list:
-    candidates = [
-        ("model", "layers"),
-        ("model", "decoder", "layers"),
-        ("transformer", "h"),
-        ("gpt_neox", "layers"),
-    ]
-    for path in candidates:
-        obj = model
-        ok = True
-        for part in path:
-            if not hasattr(obj, part):
-                ok = False
-                break
-            obj = getattr(obj, part)
-        if ok:
-            return list(obj)
-    raise AttributeError("Could not locate decoder layers on this HF model")
+def apply_layer_shift(
+    hidden: torch.Tensor,
+    directions: torch.Tensor,
+    deltas: torch.Tensor,
+    weights: torch.Tensor,
+    alpha: float,
+) -> torch.Tensor:
+    """Apply a normalized cosine-weighted intervention."""
+    directions = directions.to(device=hidden.device, dtype=hidden.dtype)
+    deltas = deltas.to(device=hidden.device, dtype=hidden.dtype)
+    weights = weights.to(device=hidden.device, dtype=hidden.dtype)
+    directions = F.normalize(directions, dim=-1, eps=1e-8)
+    cosine = (hidden @ directions.T) / hidden.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    shift = (cosine * deltas * weights) @ directions
+    return hidden - float(alpha) * shift
 
 
 @dataclass
@@ -54,6 +52,8 @@ class GSAEArtifacts:
     ) -> None:
         self.device = choose_device(str(device))
         self.layers = [int(l) for l in layers]
+        if not self.layers or len(set(self.layers)) != len(self.layers):
+            raise ValueError("Target layers must be nonempty and unique")
         self.models = {}
         for layer in self.layers:
             model, _ = load_gsae_checkpoint(checkpoint_path(trained_dir, layer), device=self.device)
@@ -61,6 +61,10 @@ class GSAEArtifacts:
             self.models[layer] = model
         self.bank = load_bank(bank_path, device=self.device)
         self.gate = load_gate(gate_path)
+        if self.gate["layers"] != self.layers:
+            raise ValueError("Runtime layer order must match the trained gate's feature order")
+        if not set(self.bank["layers"]).issubset(self.layers):
+            raise ValueError("Every bank source layer must be included in the runtime layers")
         self.thresholds = self.gate["thresholds"]
 
     @torch.no_grad()
@@ -81,33 +85,21 @@ class GSAEArtifacts:
         return float(clf.predict(z)[0])
 
     @torch.no_grad()
-    def prompt_risk(self, hf_outputs, attention_mask: torch.Tensor) -> float:
-        hiddens = {}
-        for layer in self.layers:
-            hiddens[layer] = mean_pool(hf_outputs.hidden_states[layer + 1], attention_mask)
+    def prompt_risk(self, layer_hiddens: dict[int, torch.Tensor], attention_mask: torch.Tensor) -> float:
+        hiddens = {layer: mean_pool(layer_hiddens[layer], attention_mask) for layer in self.layers}
         return self.risk_from_layer_hiddens(hiddens)
 
     def layer_shift(self, layer: int, hidden_last: torch.Tensor, alpha: float) -> torch.Tensor:
         layer_bank = self.bank["layers"].get(int(layer))
         if not layer_bank:
             return hidden_last
-        directions = layer_bank["directions"].to(hidden_last.device, dtype=hidden_last.dtype)
-        deltas = layer_bank["deltas"].to(hidden_last.device, dtype=hidden_last.dtype)
-        weights = layer_bank["weights"].to(hidden_last.device, dtype=hidden_last.dtype)
-        dirs = F.normalize(directions, dim=1, eps=1e-8)
-        h = hidden_last
-        h_norm = h.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-        cos = (h @ dirs.T) / h_norm
-        coeff = cos * deltas.unsqueeze(0) * weights.unsqueeze(0)
-        shift = coeff @ dirs
-        return h - float(alpha) * shift
+        return apply_layer_shift(
+            hidden_last, layer_bank["directions"], layer_bank["deltas"], layer_bank["weights"], alpha
+        )
 
 
 class _ControllerState:
     def __init__(self, artifacts: GSAEArtifacts, initial_risk: float) -> None:
-        # initial_risk is recorded for telemetry only; per Algorithm 3 the
-        # continuation gate starts from mu=0 and only activates after n_up
-        # consecutive token-level threshold crossings above d_high.
         self.artifacts = artifacts
         t = artifacts.thresholds
         self.d_low = float(t["cont_d_low"])
@@ -118,17 +110,11 @@ class _ControllerState:
         self.active = False
         self.up_count = 0
         self.down_count = 0
-        self.current: dict[int, torch.Tensor] = {}
-        self.max_layer = max(artifacts.layers)
 
-    def observe(self, layer: int, hidden_last: torch.Tensor) -> None:
-        self.current[int(layer)] = hidden_last.detach().float()
-        if int(layer) != self.max_layer:
-            return
-        if not all(layer_id in self.current for layer_id in self.artifacts.layers):
-            return
-        risk = self.artifacts.risk_from_layer_hiddens(self.current)
-        self.current = {}
+    def observe(self, layer_hiddens: dict[int, torch.Tensor]) -> None:
+        self.update(self.artifacts.risk_from_layer_hiddens(layer_hiddens))
+
+    def update(self, risk: float) -> None:
         if risk > self.d_high:
             self.up_count += 1
             self.down_count = 0
@@ -139,6 +125,76 @@ class _ControllerState:
             self.up_count = 0
             if self.down_count >= self.n_down:
                 self.active = False
+        else:
+            self.up_count = 0
+            self.down_count = 0
+
+
+def _monitored_generation_kwargs(model, generation_kwargs: dict[str, Any]) -> dict[str, Any]:
+    kwargs = dict(generation_kwargs)
+    config = kwargs.get("generation_config", getattr(model, "generation_config", None))
+
+    def option(name, default=None):
+        return kwargs.get(name, getattr(config, name, default))
+
+    if kwargs.get("use_cache") is True:
+        raise ValueError("Monitored generation requires use_cache=False to observe the complete current prefix")
+    if option("num_beams", 1) != 1 or option("num_return_sequences", 1) != 1:
+        raise ValueError("Monitored generation supports one greedy or sampled sequence, with num_beams=1")
+    for name in (
+        "assistant_model", "prompt_lookup_num_tokens", "penalty_alpha", "dola_layers",
+        "custom_generate", "past_key_values", "inputs_embeds",
+    ):
+        if option(name) is not None:
+            raise ValueError(f"Monitored generation does not support {name}")
+    if option("token_healing", False):
+        raise ValueError("Monitored generation does not support token_healing")
+    kwargs["use_cache"] = False
+    return kwargs
+
+
+@contextmanager
+def _monitor_generation(model, artifacts: GSAEArtifacts, state: _ControllerState, alpha: float):
+    """Observe each complete prefix before steering its next-token forward pass."""
+    observing = False
+    handles = []
+
+    def observe_prefix(_module, args, kwargs):
+        nonlocal observing
+        if observing:
+            return
+        observing = True
+        try:
+            with capture_layer_hiddens(model, artifacts.layers) as hiddens:
+                model(*args, **kwargs)
+            state.observe({layer: hidden[:, -1, :] for layer, hidden in hiddens.items()})
+        finally:
+            observing = False
+
+    def make_hook(layer):
+        def steer(_module, _inputs, output):
+            if observing or not state.active:
+                return None
+            hidden = output[0] if isinstance(output, (tuple, list)) else output
+            modified = hidden.clone()
+            modified[:, -1, :] = artifacts.layer_shift(layer, hidden[:, -1, :], alpha)
+            if isinstance(output, tuple):
+                return (modified, *output[1:])
+            if isinstance(output, list):
+                return [modified, *output[1:]]
+            return modified
+
+        return steer
+
+    try:
+        handles.append(model.register_forward_pre_hook(observe_prefix, with_kwargs=True))
+        decoder_layers = get_decoder_layers(model)
+        for layer in artifacts.layers:
+            handles.append(decoder_layers[layer].register_forward_hook(make_hook(layer)))
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def generate_with_gsae(
@@ -150,49 +206,31 @@ def generate_with_gsae(
     runtime: RuntimeConfig | None = None,
     generation_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Generate one continuation with a shared controller across source layers.
+
+    Recompute each complete prefix without a KV cache for observation and decoding.
+    """
     runtime = runtime or RuntimeConfig()
-    generation_kwargs = generation_kwargs or {}
+    generation_kwargs = dict(generation_kwargs or {})
+    generation_kwargs.setdefault("do_sample", False)
     device = artifacts.device
     encoded = tokenizer(prompt, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model(**encoded, output_hidden_states=True, use_cache=False)
-    risk = artifacts.prompt_risk(outputs, encoded["attention_mask"])
+    with torch.no_grad(), capture_layer_hiddens(model, artifacts.layers) as hiddens:
+        model(**encoded, use_cache=False)
+    risk = artifacts.prompt_risk(hiddens, encoded["attention_mask"])
     thresholds = artifacts.thresholds
     if risk >= float(thresholds["input_t_high"]):
         return {"prompt": prompt, "risk": risk, "mode": "immediate_refusal", "text": runtime.refusal_template}
     if risk < float(thresholds["input_t_low"]):
-        out = model.generate(**encoded, max_new_tokens=max_new_tokens, **generation_kwargs)
-        return {"prompt": prompt, "risk": risk, "mode": "standard", "text": tokenizer.decode(out[0], skip_special_tokens=True)}
-
-    decoder_layers = get_decoder_layers(model)
-    state = _ControllerState(artifacts, risk)
-    handles = []
-
-    def make_hook(layer_id: int):
-        def hook(_module, _inputs, output):
-            if isinstance(output, tuple):
-                hidden = output[0]
-                rest = output[1:]
-            else:
-                hidden = output
-                rest = None
-            hidden_last = hidden[:, -1, :]
-            state.observe(layer_id, hidden_last)
-            if state.active:
-                modified = hidden.clone()
-                modified[:, -1, :] = artifacts.layer_shift(layer_id, hidden_last, runtime.alpha).to(modified.dtype)
-                hidden = modified
-            if rest is None:
-                return hidden
-            return (hidden, *rest)
-
-        return hook
-
-    try:
-        for layer in artifacts.layers:
-            handles.append(decoder_layers[layer].register_forward_hook(make_hook(layer)))
-        out = model.generate(**encoded, max_new_tokens=max_new_tokens, **generation_kwargs)
-    finally:
-        for handle in handles:
-            handle.remove()
-    return {"prompt": prompt, "risk": risk, "mode": "monitored", "text": tokenizer.decode(out[0], skip_special_tokens=True)}
+        mode = "standard"
+        with torch.no_grad():
+            out = model.generate(**encoded, max_new_tokens=max_new_tokens, **generation_kwargs)
+    else:
+        mode = "monitored"
+        generation_kwargs = _monitored_generation_kwargs(model, generation_kwargs)
+        state = _ControllerState(artifacts, risk)
+        with torch.no_grad(), _monitor_generation(model, artifacts, state, runtime.alpha):
+            out = model.generate(**encoded, max_new_tokens=max_new_tokens, **generation_kwargs)
+    sequences = out.sequences if hasattr(out, "sequences") else out
+    new_tokens = sequences[0, encoded["input_ids"].shape[1]:]
+    return {"prompt": prompt, "risk": risk, "mode": mode, "text": tokenizer.decode(new_tokens, skip_special_tokens=True)}

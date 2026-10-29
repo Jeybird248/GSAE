@@ -1,0 +1,13 @@
+include configs/default.yaml
+include containers/gsae.def
+prune tests
+prune scripts
+prune condor
+prune jobs
+prune data
+prune outputs
+prune logs
+prune reports
+exclude COMMANDS.txt
+exclude PAPER_ALIGNMENT.md
+global-exclude __pycache__ *.py[cod]

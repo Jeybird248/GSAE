@@ -11,7 +11,7 @@ training:
   lambda_graph: 0.001
   graph_threshold: 0.6
   graph_chunk_size: 1024
-  normalize_decoder: true
+  normalize_decoder: false
 
 bank:
   eta: 1.0
@@ -20,7 +20,6 @@ bank:
   a: 1.0
   b: 1.0
   c: 1.0
-  efficacy_mode: activation_proxy
   efficacy_file:
   eps_srr: 0.05
 
@@ -51,7 +50,7 @@ model_presets:
     layers: [10, 14, 18, 22]
     hidden_dim: 5120
     latent_multiplier: 16
-  phi4_15b:
+  phi4_14b:
     layers: [8, 12, 16, 20]
     hidden_dim: 5120
     latent_multiplier: 16

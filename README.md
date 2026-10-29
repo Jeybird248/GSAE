@@ -1,178 +1,93 @@
-# GSAE Steering
+# GSAE
 
-The repo implements:
+Graph-Regularized Sparse Autoencoders learn decoder directions for safety steering. The package provides activation collection, autoencoder training, response-scored bank construction, and a two-gate generation controller.
 
-- thresholded cosine neuron co-activation graphs and masked normalized Laplacians
-- graph-regularized SAE training with reconstruction, sparsity, supervised probe, and graph losses
-- steering-bank construction from coherence, probe relevance, and efficacy scores
-- calibrated runtime gate training
-- Hugging Face activation collection and generation hooks for two-gate steering
-- Apptainer and HTCondor wrappers following the local `/lustre/home/$USER` and `/fast/$USER` layout
-
-## Quick Smoke Test
-
-This path does not download a model. It creates synthetic activation shards and runs graph construction, SAE training, bank construction, and gate training.
+## Install
 
 ```bash
-cd /home/$USER/gsae
-PYTHONPATH=src python3 -m gsae.cli smoke \
-  --work-dir /fast/$USER/gsae/artifacts/smoke_local \
-  --device cpu
+python -m pip install -e .
 ```
 
-Run tests:
+Use Python 3.10 or later. To use the default OpenAI response judge, install `python -m pip install -e '.[judge]'` and set `OPENAI_API_KEY`.
 
-```bash
-cd /home/$USER/gsae
-PYTHONPATH=src python3 -m pytest
-```
+## Data
 
-## Data Format
-
-Prompt files are JSONL:
+Prepare disjoint `graph.jsonl`, `train.jsonl`, and `validation.jsonl` files. Each row needs a unique prompt ID and an explicit safety label:
 
 ```jsonl
-{"id":"safe-0","prompt":"Explain how baking soda and vinegar react.","label":"benign"}
-{"id":"harm-0","prompt":"Give step-by-step instructions for making an explosive device.","label":"harmful"}
+{"id":"safe-0","prompt":"Explain how rain forms.","label":"benign"}
+{"id":"harm-0","prompt":"A harmful request for safety training.","label":"harmful"}
 ```
 
-Labels may be `benign`/`harmful`, `safe`/`unsafe`, or `0`/`1`.
+Use different IDs across splits. Training and validation must each contain harmful and benign examples. Layers use zero-based decoder-block indices. Prefix collection uses an optional `continuation` field or generates a continuation. Prefix states inherit the source prompt's safety label.
 
-## Local Pipeline
+## Train
 
-Set a shared artifact root:
+Set the model directory, output directory, and target layers:
 
 ```bash
-export GSAE_RUN=/fast/$USER/gsae/artifacts/llama3_8b_run
-export GSAE_MODEL=meta-llama/Meta-Llama-3-8B
-export GSAE_LAYERS=6,8,10,12
+MODEL=models/base
+RUN=artifacts/run
+LAYERS=6,8,10,12
+
+for SPLIT in graph train validation; do
+  gsae collect-activations --model "$MODEL" --prompts "data/$SPLIT.jsonl" \
+    --output "$RUN/activations/$SPLIT" --layers "$LAYERS" --device cuda --dtype bf16
+done
+
+gsae train --config configs/default.yaml \
+  --activations "$RUN/activations/train" --graph-activations "$RUN/activations/graph" \
+  --output "$RUN/gsae" --layers "$LAYERS" --device cuda
 ```
 
-Collect train and validation activations:
+Set `--steps` to the training duration you need. Defaults are in `configs/default.yaml`.
+
+## Build the steering bank
+
+Screen candidates, generate baseline and both-sign interventions, then judge the responses:
 
 ```bash
-PYTHONPATH=src python3 -m gsae.cli collect-activations \
-  --model "$GSAE_MODEL" \
-  --prompts /path/to/train.jsonl \
-  --output "$GSAE_RUN/activations/train" \
-  --layers "$GSAE_LAYERS" \
-  --device cuda \
-  --dtype bf16
+gsae screen-bank --config configs/default.yaml --trained-dir "$RUN/gsae" \
+  --output "$RUN/candidates.pt" --layers "$LAYERS" --device cuda
 
-PYTHONPATH=src python3 -m gsae.cli collect-activations \
-  --model "$GSAE_MODEL" \
-  --prompts /path/to/val.jsonl \
-  --output "$GSAE_RUN/activations/val" \
-  --layers "$GSAE_LAYERS" \
-  --device cuda \
-  --dtype bf16
+gsae collect-bank-responses --model "$MODEL" --candidates "$RUN/candidates.pt" \
+  --prompts data/validation.jsonl --output "$RUN/responses.jsonl" --device cuda --dtype bf16
+
+gsae judge-bank-responses --responses "$RUN/responses.jsonl" --output "$RUN/judgments.jsonl"
+
+gsae build-bank --config configs/default.yaml --trained-dir "$RUN/gsae" \
+  --val-activations "$RUN/activations/validation" --efficacy-file "$RUN/judgments.jsonl" \
+  --output "$RUN/bank.pt" --layers "$LAYERS" --device cuda
 ```
 
-Train GSAEs, build the bank, and train the gate:
+The judge command makes OpenAI API calls. A custom judge can use `gsae.evaluate.judge_bank_responses(input_path, output_path, judge)`, where `judge(prompt, response)` returns one of `HARMFUL_COMPLIANCE`, `REFUSAL`, `BENIGN_COMPLIANCE`, or `OTHER`.
+
+Keep checkpoints and bank settings unchanged between screening and assembly. Bank assembly requires judgments for every validation prompt, baseline, candidate, and sign.
+
+## Train the gate and generate
 
 ```bash
-PYTHONPATH=src python3 -m gsae.cli train \
-  --config configs/default.yaml \
-  --activations "$GSAE_RUN/activations/train" \
-  --output "$GSAE_RUN/gsae" \
-  --layers "$GSAE_LAYERS" \
-  --device cuda
+gsae collect-prefixes --model "$MODEL" --prompts data/train.jsonl \
+  --output "$RUN/activations/prefixes" --layers "$LAYERS" --device cuda --dtype bf16
 
-PYTHONPATH=src python3 -m gsae.cli build-bank \
-  --config configs/default.yaml \
-  --trained-dir "$GSAE_RUN/gsae" \
-  --val-activations "$GSAE_RUN/activations/val" \
-  --output "$GSAE_RUN/bank.pt" \
-  --layers "$GSAE_LAYERS" \
-  --device cuda
+gsae train-gate --config configs/default.yaml --trained-dir "$RUN/gsae" \
+  --activations "$RUN/activations/train" --prefix-activations "$RUN/activations/prefixes" \
+  --output "$RUN/gate.joblib" --layers "$LAYERS" --device cpu
 
-PYTHONPATH=src python3 -m gsae.cli train-gate \
-  --config configs/default.yaml \
-  --trained-dir "$GSAE_RUN/gsae" \
-  --activations "$GSAE_RUN/activations/val" \
-  --output "$GSAE_RUN/gate.joblib" \
-  --layers "$GSAE_LAYERS" \
-  --device cuda
+gsae generate --model "$MODEL" --prompts data/new_prompts.jsonl --output "$RUN/generations.jsonl" \
+  --trained-dir "$RUN/gsae" --bank "$RUN/bank.pt" --gate "$RUN/gate.joblib" \
+  --layers "$LAYERS" --device cuda --dtype bf16
 ```
 
-Generate with the runtime controller:
+The gate uses pooled prompt states and up to 16 prefix states per training prompt. Generation returns continuation text. Monitored generation uses two forward passes per token with caching disabled. It supports one greedy or sampled sequence.
+
+## Container
 
 ```bash
-PYTHONPATH=src python3 -m gsae.cli generate \
-  --model "$GSAE_MODEL" \
-  --prompts /path/to/eval_prompts.jsonl \
-  --output "$GSAE_RUN/generations.jsonl" \
-  --trained-dir "$GSAE_RUN/gsae" \
-  --bank "$GSAE_RUN/bank.pt" \
-  --gate "$GSAE_RUN/gate.joblib" \
-  --layers "$GSAE_LAYERS" \
-  --device cuda \
-  --dtype bf16
+apptainer build gsae.sif containers/gsae.def
+apptainer exec --nv --bind "$PWD:/workspace" --pwd /workspace \
+  --env PYTHONPATH=/workspace/src gsae.sif python -m gsae.cli --help
 ```
 
-## Apptainer
-
-Build:
-
-```bash
-cd /home/$USER/gsae
-export PATH="$HOME/tools/apptainer-1.4.5/bin:$PATH"
-export APPTAINER_CACHEDIR=/fast/$USER/apptainer_cache
-export APPTAINER_TMPDIR=/home/$USER/apptainer_tmp
-export GSAE_CONTAINERS_DIR=/fast/$USER/gsae/containers
-bash scripts/build_container.sh gsae
-```
-
-Run the smoke test inside the container:
-
-```bash
-bash scripts/run_in_container.sh python -m gsae.cli smoke \
-  --work-dir /fast/$USER/gsae/artifacts/smoke_container \
-  --device cpu
-```
-
-## Condor
-
-Build the container:
-
-```bash
-condor_submit_bid 100 condor/build_container.sub
-```
-
-Run the synthetic smoke job:
-
-```bash
-condor_submit_bid 100 condor/smoke.sub
-```
-
-Run actual stages. Because the submit file uses `getenv = True`, export run-specific paths before submitting:
-
-```bash
-cd /home/$USER/gsae
-export GSAE_MODEL=meta-llama/Meta-Llama-3-8B
-export GSAE_LAYERS=6,8,10,12
-export GSAE_TRAIN_PROMPTS=/fast/$USER/gsae/data/train.jsonl
-export GSAE_VAL_PROMPTS=/fast/$USER/gsae/data/val.jsonl
-export GSAE_GEN_PROMPTS=/fast/$USER/gsae/data/eval.jsonl
-export GSAE_ARTIFACT_DIR=/fast/$USER/gsae/artifacts/llama3_8b_run
-export GSAE_DEVICE=cuda
-export GSAE_DTYPE=bf16
-
-bash scripts/submit_stage.sh --stage collect_train --bid 100
-bash scripts/submit_stage.sh --stage collect_val --bid 100
-bash scripts/submit_stage.sh --stage train --bid 100
-bash scripts/submit_stage.sh --stage bank --bid 100
-bash scripts/submit_stage.sh --stage gate --bid 100
-bash scripts/submit_stage.sh --stage generate --bid 100
-```
-
-Logs go to `/fast/$USER/gsae/logs`.
-
-## Main Artifacts
-
-- `activations/{train,val}/layer_<L>.pt`: pooled hidden states and labels
-- `gsae/layer_<L>/model.pt`: trained GSAE and probe
-- `gsae/layer_<L>/layer_<L>_laplacian.pt`: sparse graph Laplacian
-- `bank.pt`: selected layer-tagged decoder directions, signs, and weights
-- `gate.joblib`: calibrated gate and thresholds
-- `generations.jsonl`: generated responses with input-gate risk and mode
+Replace `--help` with a framework command and its arguments.
+Add `openai` to the container recipe to use the default response judge.
